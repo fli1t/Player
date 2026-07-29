@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Transmissão ao vivo</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+<style>
+  html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;}
+  #stage{position:fixed;inset:0;background:#000;}
+  video{width:100%;height:100%;object-fit:contain;background:#000;}
+
+  #tapOverlay{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.55);color:#eee;font:500 15px system-ui,sans-serif;
+    text-align:center;z-index:5;
+  }
+  #tapOverlay span{
+    border:1px solid rgba(255,255,255,.35);padding:12px 20px;border-radius:30px;
+  }
+
+  #spinner{
+    position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+    width:34px;height:34px;border-radius:50%;
+    border:3px solid rgba(255,255,255,.15);border-top-color:#fff;
+    animation:spin .7s linear infinite;display:none;z-index:4;
+  }
+  @keyframes spin{to{transform:translate(-50%,-50%) rotate(360deg);}}
+
+  #msg{
+    position:fixed;left:0;right:0;bottom:22px;text-align:center;
+    color:rgba(255,255,255,.55);font:400 11px system-ui,sans-serif;
+    letter-spacing:.02em;z-index:4;pointer-events:none;
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="v" playsinline muted autoplay></video>
+</div>
+<div id="spinner"></div>
+<div id="msg"></div>
+<div id="tapOverlay"><span>toque para ativar o som</span></div>
+
+<script>
+(function(){
+'use strict';
+
+// ---- ÚNICA COISA QUE MUDA A CADA JOGO/CANAL ----
+// Cole aqui o trecho da sua lista m3u com as fontes JÁ TESTADAS.
+// Ordem: melhor qualidade primeiro (o player desce a lista se travar).
+const M3U_TEXT = `
+#EXTM3U
+#EXTINF:-1 tvg-id="ESPN" tvg-name="ESPN FHD²" group-title="ESPN",ESPN FHD²
+http://tvlol32.com:80/71dxqi/n7ilp530/16856
+#EXTINF:-1 tvg-id="ESPN" tvg-name="ESPN HD²" group-title="ESPN",ESPN HD²
+http://tvlol32.com:80/71dxqi/n7ilp530/6887
+#EXTINF:-1 tvg-id="ESPN" tvg-name="ESPN SD²" group-title="ESPN",ESPN SD²
+http://tvlol32.com:80/71dxqi/n7ilp530/10823
+`;
+
+function parseM3U(text){
+  const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  const out = [];
+  let pendingName = null;
+  lines.forEach(l=>{
+    if(l.startsWith('#EXTINF')){
+      const ci = l.lastIndexOf(',');
+      pendingName = ci!==-1 ? l.slice(ci+1).trim() : 'Sem nome';
+    } else if(!l.startsWith('#')){
+      out.push({ label: pendingName || l, url: l });
+      pendingName = null;
+    }
+  });
+  return out;
+}
+
+const SOURCES = parseM3U(M3U_TEXT);
+// -------------------------------------------
+
+const v = document.getElementById('v');
+const spinner = document.getElementById('spinner');
+const msg = document.getElementById('msg');
+const tapOverlay = document.getElementById('tapOverlay');
+
+let hls = null, mpegPlayer = null;
+let levelIdx = 0;
+let events = [];              // {type:'stall'|'error', t:Date.now()}
+let lastSwitch = 0;
+let stableSince = Date.now();
+let lastWaitingLog = 0;
+
+const WINDOW_MS      = 25000; // janela de observação
+const COOLDOWN_MS    = 15000; // tempo mínimo entre trocas
+const UPGRADE_MS     = 50000; // estabilidade exigida pra subir de qualidade
+
+function showMsg(t){ msg.textContent = t; }
+
+function pruneEvents(){
+  const now = Date.now();
+  events = events.filter(e => now - e.t < WINDOW_MS);
+}
+
+function registerEvent(type){
+  const now = Date.now();
+  // debounce: ignora repetição do mesmo tipo em menos de 3s
+  const last = [...events].reverse().find(e => e.type===type);
+  if(last && now - last.t < 3000) return;
+  events.push({type, t:now});
+  stableSince = now;
+  evaluate();
+}
+
+function evaluate(){
+  pruneEvents();
+  const now = Date.now();
+  if(now - lastSwitch < COOLDOWN_MS) return;
+
+  const stalls = events.filter(e=>e.type==='stall').length;
+  const errors = events.filter(e=>e.type==='error').length;
+
+  if((stalls>=2 || errors>=1) && levelIdx < SOURCES.length-1){
+    switchTo(levelIdx+1, 'baixando qualidade');
+    return;
+  }
+  if(levelIdx>0 && events.length===0 && (now - stableSince) > UPGRADE_MS){
+    switchTo(levelIdx-1, 'subindo qualidade');
+  }
+}
+
+function destroyPlayers(){
+  if(hls){ try{ hls.destroy(); }catch(e){} hls=null; }
+  if(mpegPlayer){ try{ mpegPlayer.pause(); mpegPlayer.unload(); mpegPlayer.detachMediaElement(); mpegPlayer.destroy(); }catch(e){} mpegPlayer=null; }
+}
+
+function isM3U8(u){ return /\.m3u8(\?|$)/i.test(u); }
+function isTS(u){ return /\.ts(\?|$)/i.test(u); }
+
+const ENGINE_TIMEOUT_MS = 6000;
+let engineTimer = null;
+
+function loadCurrent(){
+  destroyPlayers();
+  spinner.style.display='block';
+  const url = SOURCES[levelIdx].url;
+  // links sem extensão (comum em painéis IPTV) tendem a ser TS puro por padrão
+  const order = isM3U8(url) ? ['hls','mpegts','native']
+              : isTS(url)   ? ['mpegts','hls','native']
+              :               ['mpegts','hls','native'];
+  attemptEngine(url, order, 0);
+}
+
+function attemptEngine(url, order, idx){
+  destroyPlayers();
+  clearTimeout(engineTimer);
+  if(idx >= order.length){
+    // nenhum motor conseguiu tocar essa qualidade: conta como erro e deixa
+    // o avaliador decidir se desce de qualidade
+    registerEvent('error');
+    if(levelIdx === SOURCES.length-1){
+      // já é a pior qualidade: não tem pra onde descer, tenta de novo em breve
+      showMsg('reconectando…');
+      setTimeout(loadCurrent, 5000);
+    }
+    return;
+  }
+  const engine = order[idx];
+  let done = false;
+
+  const onOk = ()=>{
+    if(done) return;
+    done = true;
+    clearTimeout(engineTimer);
+    spinner.style.display='none';
+  };
+  const onFail = ()=>{
+    if(done) return;
+    done = true;
+    attemptEngine(url, order, idx+1);
+  };
+
+  v.onwaiting = ()=>{ spinner.style.display='block'; if(done) registerEvent('stall'); };
+  v.onplaying = onOk;
+  v.onloadedmetadata = onOk;
+  v.onerror = onFail;
+
+  engineTimer = setTimeout(()=>{ if(!done) onFail(); }, ENGINE_TIMEOUT_MS);
+
+  if(engine==='hls'){
+    if(window.Hls && Hls.isSupported()){
+      hls = new Hls({ maxBufferLength:20 });
+      hls.on(Hls.Events.ERROR, (ev,d)=>{ if(d.fatal) onFail(); });
+      hls.loadSource(url);
+      hls.attachMedia(v);
+    } else { onFail(); return; }
+  } else if(engine==='mpegts'){
+    if(window.mpegts && mpegts.isSupported()){
+      mpegPlayer = mpegts.createPlayer({ type:'mpegts', isLive:true, url });
+      mpegPlayer.on(mpegts.Events.ERROR, onFail);
+      mpegPlayer.attachMediaElement(v);
+      mpegPlayer.load();
+    } else { onFail(); return; }
+  } else {
+    v.src = url;
+  }
+  v.play().catch(()=>{});
+}
+
+function switchTo(newIdx, reason){
+  levelIdx = newIdx;
+  lastSwitch = Date.now();
+  stableSince = Date.now();
+  events = [];
+  showMsg(reason ? `${reason} · ${SOURCES[levelIdx].label}` : SOURCES[levelIdx].label);
+  loadCurrent();
+  setTimeout(()=>showMsg(''), 2500);
+}
+
+// checagem periódica pra permitir upgrade mesmo sem novos eventos
+setInterval(evaluate, 10000);
+
+// desmutar no primeiro toque (autoplay com som exige gesto do usuário)
+tapOverlay.addEventListener('click', ()=>{
+  v.muted = false;
+  tapOverlay.remove();
+}, { once:true });
+
+loadCurrent();
+})();
+</script>
+</body>
+</html>
